@@ -98,6 +98,39 @@ async def lifespan(app: FastAPI):
         browser_service = await BrowserCaptchaService.get_instance(db)
         await browser_service.warmup_browser_slots()
         print("? Browser captcha service initialized (headed mode)")
+    elif captcha_config.captcha_method == "bitbrowser":
+        from .services.browser_captcha_bitbrowser import BrowserCaptchaService
+        browser_service = await BrowserCaptchaService.get_instance(db)
+        print("✓ Browser captcha service initialized (BitBrowser mode)")
+
+        warmup_limit = max(1, int(config.personal_max_resident_tabs or 1))
+        warmup_project_ids = await token_manager.get_personal_warmup_project_ids(
+            tokens=tokens,
+            limit=warmup_limit,
+        )
+
+        warmed_slots = []
+        warmup_error = None
+        try:
+            warmed_slots = await browser_service.warmup_resident_tabs(
+                warmup_project_ids,
+                limit=warmup_limit,
+            )
+        except Exception as e:
+            warmup_error = e
+            print(
+                "⚠ BitBrowser captcha warmup failed: "
+                f"{type(e).__name__}: {e}"
+            )
+        if warmed_slots:
+            print(f"✓ BitBrowser captcha pages warmed ({len(warmed_slots)} slot(s), limit={warmup_limit})")
+        elif warmup_error is not None:
+            print("⚠ BitBrowser captcha warmup skipped for this startup")
+        elif tokens:
+            print("⚠ BitBrowser captcha warmup skipped: no page warmed successfully")
+        else:
+            await browser_service.open_login_window()
+            print("⚠ No active token found, opened BitBrowser login window for manual setup")
 
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)
@@ -147,7 +180,11 @@ async def lifespan(app: FastAPI):
         pass
     # Close browser if initialized
     if browser_service:
-        await browser_service.close()
+        if config.captcha_method == "bitbrowser":
+            from .services.browser_captcha_bitbrowser import BrowserCaptchaService
+            await BrowserCaptchaService.close_all_instances()
+        else:
+            await browser_service.close()
         print("✓ Browser captcha service closed")
     print("✓ File cache cleanup task stopped")
     print("✓ 429 auto-unban task stopped")

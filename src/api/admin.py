@@ -483,6 +483,7 @@ class AddTokenRequest(BaseModel):
     remark: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    bit_browser_id: Optional[str] = None
     image_enabled: bool = True
     video_enabled: bool = True
     image_concurrency: int = -1
@@ -496,6 +497,7 @@ class UpdateTokenRequest(BaseModel):
     remark: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    bit_browser_id: Optional[str] = None
     image_enabled: Optional[bool] = None
     video_enabled: Optional[bool] = None
     image_concurrency: Optional[int] = None
@@ -564,6 +566,7 @@ class ImportTokenItem(BaseModel):
     is_active: bool = True
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    bit_browser_id: Optional[str] = None
     image_enabled: bool = True
     video_enabled: bool = True
     image_concurrency: int = -1
@@ -695,6 +698,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "current_project_name": row.get("current_project_name"),  # 🆕 项目名称
         "captcha_proxy_url": row.get("captcha_proxy_url") or "",
         "extension_route_key": row.get("extension_route_key") or "",
+        "bit_browser_id": row.get("bit_browser_id") or "",
         "image_enabled": bool(row.get("image_enabled")),
         "video_enabled": bool(row.get("video_enabled")),
         "image_concurrency": row.get("image_concurrency"),
@@ -724,6 +728,7 @@ async def add_token(
             remark=request.remark,
             captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
             extension_route_key=request.extension_route_key.strip() if request.extension_route_key is not None else None,
+            bit_browser_id=request.bit_browser_id.strip() if request.bit_browser_id is not None else None,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
@@ -788,6 +793,7 @@ async def update_token(
             remark=request.remark,
             captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
             extension_route_key=request.extension_route_key.strip() if request.extension_route_key is not None else None,
+            bit_browser_id=request.bit_browser_id.strip() if request.bit_browser_id is not None else None,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
@@ -884,7 +890,7 @@ async def refresh_at(
             updated_token = await token_manager.get_token(token_id)
             
             message = "AT刷新成功"
-            if config.captcha_method == "personal":
+            if config.captcha_method in {"personal", "bitbrowser"}:
                 message += "（支持ST自动刷新）"
             
             debug_logger.log_info(f"[API] AT 刷新成功: token_id={token_id}")
@@ -902,8 +908,8 @@ async def refresh_at(
             debug_logger.log_error(f"[API] AT 刷新失败: token_id={token_id}")
             
             error_detail = "AT刷新失败"
-            if config.captcha_method != "personal":
-                error_detail += f"（当前打码模式: {config.captcha_method}，ST自动刷新仅在 personal 模式下可用）"
+            if config.captcha_method not in {"personal", "bitbrowser"}:
+                error_detail += f"（当前打码模式: {config.captcha_method}，ST自动刷新仅在 personal/bitbrowser 模式下可用）"
             
             raise HTTPException(status_code=500, detail=error_detail)
     except HTTPException:
@@ -992,6 +998,7 @@ async def import_tokens(
                         at_expires=at_expires,
                         captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
                         extension_route_key=item.extension_route_key.strip() if item.extension_route_key is not None else None,
+                        bit_browser_id=item.bit_browser_id.strip() if item.bit_browser_id is not None else None,
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,
@@ -1006,6 +1013,7 @@ async def import_tokens(
                     existing.at_expires = at_expires
                     existing.captcha_proxy_url = item.captcha_proxy_url
                     existing.extension_route_key = item.extension_route_key
+                    existing.bit_browser_id = item.bit_browser_id
                     existing.image_enabled = item.image_enabled
                     existing.video_enabled = item.video_enabled
                     existing.image_concurrency = item.image_concurrency
@@ -1017,6 +1025,7 @@ async def import_tokens(
                         st=st,
                         captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
                         extension_route_key=item.extension_route_key.strip() if item.extension_route_key is not None else None,
+                        bit_browser_id=item.bit_browser_id.strip() if item.bit_browser_id is not None else None,
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,
@@ -1584,6 +1593,9 @@ async def update_captcha_config(
     remote_browser_base_url = request.get("remote_browser_base_url")
     remote_browser_api_key = request.get("remote_browser_api_key")
     remote_browser_timeout = request.get("remote_browser_timeout", 60)
+    bit_browser_base_url = request.get("bit_browser_base_url", "http://127.0.0.1:54345")
+    bit_browser_id = request.get("bit_browser_id", "")
+    bit_browser_close_on_shutdown = request.get("bit_browser_close_on_shutdown", False)
     browser_proxy_enabled = request.get("browser_proxy_enabled", False)
     browser_proxy_url = request.get("browser_proxy_url", "")
     browser_count = request.get("browser_count", 1)
@@ -1603,6 +1615,12 @@ async def update_captcha_config(
         except RuntimeError as e:
             return {"success": False, "message": str(e)}
 
+    if bit_browser_base_url:
+        try:
+            bit_browser_base_url = _normalize_http_base_url(bit_browser_base_url)
+        except RuntimeError as e:
+            return {"success": False, "message": str(e)}
+
     try:
         remote_browser_timeout = max(5, int(remote_browser_timeout or 60))
     except Exception:
@@ -1613,6 +1631,10 @@ async def update_captcha_config(
             return {"success": False, "message": "remote_browser 模式需要配置远程打码服务地址"}
         if not (remote_browser_api_key or "").strip():
             return {"success": False, "message": "remote_browser 模式需要配置远程打码服务 API Key"}
+
+    if captcha_method == "bitbrowser":
+        if not (bit_browser_base_url or "").strip():
+            return {"success": False, "message": "bitbrowser 模式需要配置 BitBrowser API 地址"}
 
     await db.update_captcha_config(
         captcha_method=captcha_method,
@@ -1627,6 +1649,9 @@ async def update_captcha_config(
         remote_browser_base_url=remote_browser_base_url,
         remote_browser_api_key=remote_browser_api_key,
         remote_browser_timeout=remote_browser_timeout,
+        bit_browser_base_url=bit_browser_base_url,
+        bit_browser_id=bit_browser_id,
+        bit_browser_close_on_shutdown=bit_browser_close_on_shutdown,
         browser_proxy_enabled=browser_proxy_enabled,
         browser_proxy_url=browser_proxy_url if browser_proxy_enabled else None,
         browser_count=max(1, int(browser_count)) if browser_count else 1,
@@ -1656,6 +1681,13 @@ async def update_captcha_config(
         except Exception as e:
             print(f"[Admin] Personal 配置热更新失败: {e}")
 
+    if captcha_method == "bitbrowser":
+        try:
+            from ..services.browser_captcha_bitbrowser import BrowserCaptchaService
+            await BrowserCaptchaService.reload_all_instances()
+        except Exception as e:
+            print(f"[Admin] BitBrowser 配置热更新失败: {e}")
+
     return {"success": True, "message": "验证码配置更新成功"}
 
 
@@ -1676,6 +1708,9 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "remote_browser_base_url": captcha_config.remote_browser_base_url,
         "remote_browser_api_key": captcha_config.remote_browser_api_key,
         "remote_browser_timeout": captcha_config.remote_browser_timeout,
+        "bit_browser_base_url": captcha_config.bit_browser_base_url,
+        "bit_browser_id": captcha_config.bit_browser_id,
+        "bit_browser_close_on_shutdown": captcha_config.bit_browser_close_on_shutdown,
         "browser_proxy_enabled": captcha_config.browser_proxy_enabled,
         "browser_proxy_url": captcha_config.browser_proxy_url or "",
         "browser_count": captcha_config.browser_count,

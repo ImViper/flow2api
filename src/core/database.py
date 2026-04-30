@@ -226,6 +226,9 @@ class Database:
             remote_browser_base_url = ""
             remote_browser_api_key = ""
             remote_browser_timeout = 60
+            bit_browser_base_url = "http://127.0.0.1:54345"
+            bit_browser_id = ""
+            bit_browser_close_on_shutdown = False
             browser_count = 1
             personal_project_pool_size = 4
             personal_max_resident_tabs = 5
@@ -239,6 +242,9 @@ class Database:
                 remote_browser_base_url = captcha_config.get("remote_browser_base_url", "")
                 remote_browser_api_key = captcha_config.get("remote_browser_api_key", "")
                 remote_browser_timeout = captcha_config.get("remote_browser_timeout", 60)
+                bit_browser_base_url = captcha_config.get("bit_browser_base_url", "http://127.0.0.1:54345")
+                bit_browser_id = captcha_config.get("bit_browser_id", "")
+                bit_browser_close_on_shutdown = captcha_config.get("bit_browser_close_on_shutdown", False)
                 browser_count = captcha_config.get("browser_count", 1)
                 personal_project_pool_size = captcha_config.get("personal_project_pool_size", 4)
                 personal_max_resident_tabs = captcha_config.get("personal_max_resident_tabs", 5)
@@ -268,10 +274,11 @@ class Database:
                 INSERT INTO captcha_config (
                     id, captcha_method, yescaptcha_api_key, yescaptcha_base_url,
                     remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
+                    bit_browser_base_url, bit_browser_id, bit_browser_close_on_shutdown,
                     browser_count, personal_project_pool_size,
                     personal_max_resident_tabs, personal_idle_tab_ttl_seconds
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 captcha_method,
                 yescaptcha_api_key,
@@ -279,6 +286,9 @@ class Database:
                 remote_browser_base_url,
                 remote_browser_api_key,
                 remote_browser_timeout,
+                (bit_browser_base_url or "http://127.0.0.1:54345").strip(),
+                (bit_browser_id or "").strip(),
+                bool(bit_browser_close_on_shutdown),
                 browser_count,
                 personal_project_pool_size,
                 personal_max_resident_tabs,
@@ -371,6 +381,9 @@ class Database:
                         remote_browser_base_url TEXT DEFAULT '',
                         remote_browser_api_key TEXT DEFAULT '',
                         remote_browser_timeout INTEGER DEFAULT 60,
+                        bit_browser_base_url TEXT DEFAULT 'http://127.0.0.1:54345',
+                        bit_browser_id TEXT DEFAULT '',
+                        bit_browser_close_on_shutdown BOOLEAN DEFAULT 0,
                         website_key TEXT DEFAULT '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV',
                         page_action TEXT DEFAULT 'IMAGE_GENERATION',
                         browser_proxy_enabled BOOLEAN DEFAULT 0,
@@ -409,6 +422,7 @@ class Database:
                     ("video_concurrency", "INTEGER DEFAULT -1"),
                     ("captcha_proxy_url", "TEXT"),  # token级打码代理
                     ("extension_route_key", "TEXT"),  # extension 模式路由键
+                    ("bit_browser_id", "TEXT"),  # token级 BitBrowser 窗口 ID
                     ("ban_reason", "TEXT"),  # 禁用原因
                     ("banned_at", "TIMESTAMP"),  # 禁用时间
                 ]
@@ -474,6 +488,9 @@ class Database:
                     ("remote_browser_base_url", "TEXT DEFAULT ''"),
                     ("remote_browser_api_key", "TEXT DEFAULT ''"),
                     ("remote_browser_timeout", "INTEGER DEFAULT 60"),
+                    ("bit_browser_base_url", "TEXT DEFAULT 'http://127.0.0.1:54345'"),
+                    ("bit_browser_id", "TEXT DEFAULT ''"),
+                    ("bit_browser_close_on_shutdown", "BOOLEAN DEFAULT 0"),
                 ]
 
                 for col_name, col_type in captcha_columns_to_add:
@@ -569,6 +586,7 @@ class Database:
                     video_concurrency INTEGER DEFAULT -1,
                     captcha_proxy_url TEXT,
                     extension_route_key TEXT,
+                    bit_browser_id TEXT,
                     ban_reason TEXT,
                     banned_at TIMESTAMP
                 )
@@ -731,6 +749,9 @@ class Database:
                     remote_browser_base_url TEXT DEFAULT '',
                     remote_browser_api_key TEXT DEFAULT '',
                     remote_browser_timeout INTEGER DEFAULT 60,
+                    bit_browser_base_url TEXT DEFAULT 'http://127.0.0.1:54345',
+                    bit_browser_id TEXT DEFAULT '',
+                    bit_browser_close_on_shutdown BOOLEAN DEFAULT 0,
                     website_key TEXT DEFAULT '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV',
                     page_action TEXT DEFAULT 'IMAGE_GENERATION',
 
@@ -848,14 +869,14 @@ class Database:
                 INSERT INTO tokens (st, at, at_expires, email, name, remark, is_active,
                                    credits, user_paygate_tier, current_project_id, current_project_name,
                                    image_enabled, video_enabled, image_concurrency, video_concurrency,
-                                   captcha_proxy_url, extension_route_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   captcha_proxy_url, extension_route_key, bit_browser_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (token.st, token.at, token.at_expires, token.email, token.name, token.remark,
                   token.is_active, token.credits, token.user_paygate_tier,
                   token.current_project_id, token.current_project_name,
                   token.image_enabled, token.video_enabled,
                   token.image_concurrency, token.video_concurrency,
-                  token.captcha_proxy_url, token.extension_route_key))
+                  token.captcha_proxy_url, token.extension_route_key, token.bit_browser_id))
             await db.commit()
             token_id = cursor.lastrowid
 
@@ -1633,6 +1654,9 @@ class Database:
             config.set_remote_browser_base_url(captcha_config.remote_browser_base_url)
             config.set_remote_browser_api_key(captcha_config.remote_browser_api_key)
             config.set_remote_browser_timeout(captcha_config.remote_browser_timeout)
+            config.set_bit_browser_base_url(captcha_config.bit_browser_base_url)
+            config.set_bit_browser_id(captcha_config.bit_browser_id)
+            config.set_bit_browser_close_on_shutdown(captcha_config.bit_browser_close_on_shutdown)
             config.set_personal_project_pool_size(captcha_config.personal_project_pool_size)
             config.set_personal_max_resident_tabs(captcha_config.personal_max_resident_tabs)
             config.set_personal_idle_tab_ttl_seconds(captcha_config.personal_idle_tab_ttl_seconds)
@@ -1765,6 +1789,9 @@ class Database:
         remote_browser_base_url: str = None,
         remote_browser_api_key: str = None,
         remote_browser_timeout: int = None,
+        bit_browser_base_url: str = None,
+        bit_browser_id: str = None,
+        bit_browser_close_on_shutdown: bool = None,
         browser_proxy_enabled: bool = None,
         browser_proxy_url: str = None,
         browser_count: int = None,
@@ -1792,6 +1819,9 @@ class Database:
                 new_remote_base_url = remote_browser_base_url if remote_browser_base_url is not None else current.get("remote_browser_base_url", "")
                 new_remote_api_key = remote_browser_api_key if remote_browser_api_key is not None else current.get("remote_browser_api_key", "")
                 new_remote_timeout = remote_browser_timeout if remote_browser_timeout is not None else current.get("remote_browser_timeout", 60)
+                new_bit_base_url = bit_browser_base_url if bit_browser_base_url is not None else current.get("bit_browser_base_url", "http://127.0.0.1:54345")
+                new_bit_browser_id = bit_browser_id if bit_browser_id is not None else current.get("bit_browser_id", "")
+                new_bit_close_on_shutdown = bit_browser_close_on_shutdown if bit_browser_close_on_shutdown is not None else current.get("bit_browser_close_on_shutdown", False)
                 new_proxy_enabled = browser_proxy_enabled if browser_proxy_enabled is not None else current.get("browser_proxy_enabled", False)
                 new_proxy_url = browser_proxy_url if browser_proxy_url is not None else current.get("browser_proxy_url")
                 new_browser_count = browser_count if browser_count is not None else current.get("browser_count", 1)
@@ -1810,6 +1840,7 @@ class Database:
                         ezcaptcha_api_key = ?, ezcaptcha_base_url = ?,
                         capsolver_api_key = ?, capsolver_base_url = ?,
                         remote_browser_base_url = ?, remote_browser_api_key = ?, remote_browser_timeout = ?,
+                        bit_browser_base_url = ?, bit_browser_id = ?, bit_browser_close_on_shutdown = ?,
                         browser_proxy_enabled = ?, browser_proxy_url = ?, browser_count = ?,
                         personal_project_pool_size = ?,
                         personal_max_resident_tabs = ?, personal_idle_tab_ttl_seconds = ?,
@@ -1818,6 +1849,7 @@ class Database:
                 """, (new_method, new_yes_key, new_yes_url, new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
+                      (new_bit_base_url or "http://127.0.0.1:54345").strip(), (new_bit_browser_id or "").strip(), bool(new_bit_close_on_shutdown),
                       new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
                       new_personal_max_tabs, new_personal_idle_ttl))
             else:
@@ -1833,6 +1865,9 @@ class Database:
                 new_remote_base_url = remote_browser_base_url if remote_browser_base_url is not None else ""
                 new_remote_api_key = remote_browser_api_key if remote_browser_api_key is not None else ""
                 new_remote_timeout = remote_browser_timeout if remote_browser_timeout is not None else 60
+                new_bit_base_url = bit_browser_base_url if bit_browser_base_url is not None else "http://127.0.0.1:54345"
+                new_bit_browser_id = bit_browser_id if bit_browser_id is not None else ""
+                new_bit_close_on_shutdown = bit_browser_close_on_shutdown if bit_browser_close_on_shutdown is not None else False
                 new_proxy_enabled = browser_proxy_enabled if browser_proxy_enabled is not None else False
                 new_proxy_url = browser_proxy_url
                 new_browser_count = browser_count if browser_count is not None else 1
@@ -1849,13 +1884,15 @@ class Database:
                         capmonster_api_key, capmonster_base_url, ezcaptcha_api_key, ezcaptcha_base_url,
                         capsolver_api_key, capsolver_base_url,
                         remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
+                        bit_browser_base_url, bit_browser_id, bit_browser_close_on_shutdown,
                         browser_proxy_enabled, browser_proxy_url, browser_count,
                         personal_project_pool_size,
                         personal_max_resident_tabs, personal_idle_tab_ttl_seconds)
-                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (new_method, new_yes_key, new_yes_url, new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
+                      (new_bit_base_url or "http://127.0.0.1:54345").strip(), (new_bit_browser_id or "").strip(), bool(new_bit_close_on_shutdown),
                       new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
                       new_personal_max_tabs, new_personal_idle_ttl))
 

@@ -44,6 +44,9 @@ class Token(BaseModel):
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
 
+    # BitBrowser 窗口 ID（token 级，可覆盖全局 BitBrowser 窗口）
+    bit_browser_id: Optional[str] = None
+
     # 429禁用相关
     ban_reason: Optional[str] = None  # 禁用原因: "429_rate_limit" 或 None
     banned_at: Optional[datetime] = None  # 禁用时间
@@ -178,7 +181,7 @@ class CaptchaConfig(BaseModel):
     """Captcha configuration"""
 
     id: int = 1
-    captcha_method: str = "browser"  # yescaptcha/capmonster/ezcaptcha/capsolver/browser/personal/remote_browser
+    captcha_method: str = "browser"  # yescaptcha/capmonster/ezcaptcha/capsolver/browser/personal/remote_browser/bitbrowser
     yescaptcha_api_key: str = ""
     yescaptcha_base_url: str = "https://api.yescaptcha.com"
     capmonster_api_key: str = ""
@@ -190,6 +193,9 @@ class CaptchaConfig(BaseModel):
     remote_browser_base_url: str = ""
     remote_browser_api_key: str = ""
     remote_browser_timeout: int = 60
+    bit_browser_base_url: str = "http://127.0.0.1:54345"
+    bit_browser_id: str = ""
+    bit_browser_close_on_shutdown: bool = False
     website_key: str = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
     page_action: str = "IMAGE_GENERATION"
     browser_proxy_enabled: bool = False  # 浏览器打码是否启用代理

@@ -576,6 +576,39 @@ class Config:
             normalized = 60
         self._config["captcha"]["remote_browser_timeout"] = normalized
 
+    @property
+    def bit_browser_base_url(self) -> str:
+        """Get BitBrowser local API base URL"""
+        return self._config.get("captcha", {}).get("bit_browser_base_url", "http://127.0.0.1:54345")
+
+    def set_bit_browser_base_url(self, base_url: str):
+        """Set BitBrowser local API base URL"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["bit_browser_base_url"] = (base_url or "http://127.0.0.1:54345").strip()
+
+    @property
+    def bit_browser_id(self) -> str:
+        """Get BitBrowser profile/window ID"""
+        return self._config.get("captcha", {}).get("bit_browser_id", "")
+
+    def set_bit_browser_id(self, browser_id: str):
+        """Set BitBrowser profile/window ID"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["bit_browser_id"] = (browser_id or "").strip()
+
+    @property
+    def bit_browser_close_on_shutdown(self) -> bool:
+        """Whether to close the BitBrowser window on service shutdown"""
+        return bool(self._config.get("captcha", {}).get("bit_browser_close_on_shutdown", False))
+
+    def set_bit_browser_close_on_shutdown(self, enabled: bool):
+        """Set BitBrowser close-on-shutdown behavior"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["bit_browser_close_on_shutdown"] = bool(enabled)
+
 
 # Global config instance
 config = Config()

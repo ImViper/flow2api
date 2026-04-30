@@ -91,6 +91,36 @@ class FlowClient:
         """设置当前请求链路的浏览器指纹上下文。"""
         self._request_fingerprint_ctx.set(dict(fingerprint) if fingerprint else None)
 
+    def _normalize_token_request_proxy(self, proxy_url: Optional[str]) -> Optional[str]:
+        """标准化 Token 级请求代理，格式错误时忽略以避免阻断生成链路。"""
+        raw_proxy = (proxy_url or "").strip()
+        if not raw_proxy:
+            return None
+
+        if self.proxy_manager and hasattr(self.proxy_manager, "normalize_proxy_url"):
+            try:
+                return self.proxy_manager.normalize_proxy_url(raw_proxy)
+            except Exception as e:
+                debug_logger.log_warning(f"[TOKEN_PROXY] Token 代理格式无效，已忽略: {e}")
+                return None
+
+        return raw_proxy
+
+    def _attach_token_proxy_to_fingerprint(
+        self,
+        fingerprint: Optional[Dict[str, Any]],
+        proxy_url: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """把 Token 级代理并入请求指纹，使后续 Flow API 请求复用同一出口。"""
+        normalized_proxy = self._normalize_token_request_proxy(proxy_url)
+        if not normalized_proxy:
+            return dict(fingerprint) if fingerprint else fingerprint
+
+        data = dict(fingerprint) if isinstance(fingerprint, dict) else {}
+        data["proxy_url"] = normalized_proxy
+        data["proxy_source"] = "token"
+        return data
+
     def get_request_fingerprint(self) -> Optional[Dict[str, Any]]:
         """获取当前请求链路绑定的浏览器指纹快照。"""
         fingerprint = self._request_fingerprint_ctx.get()
@@ -2365,6 +2395,24 @@ class FlowClient:
                 )
             except Exception:
                 pass
+        elif config.captcha_method == "bitbrowser" and project_id:
+            try:
+                from .browser_captcha_bitbrowser import BrowserCaptchaService
+                bit_browser_id = None
+                if self.db:
+                    project = await self.db.get_project_by_id(project_id)
+                    if project and project.token_id:
+                        token = await self.db.get_token(project.token_id)
+                        bit_browser_id = getattr(token, "bit_browser_id", None) if token else None
+                service = await BrowserCaptchaService.get_instance(self.db, bit_browser_id=bit_browser_id)
+                await service.report_flow_error(
+                    project_id=project_id,
+                    error_reason=error_reason or "",
+                    error_message=error_message or "",
+                    bit_browser_id=bit_browser_id,
+                )
+            except Exception:
+                pass
         elif config.captcha_method == "remote_browser" and browser_id:
             try:
                 session_id = quote(str(browser_id), safe="")
@@ -2703,6 +2751,41 @@ class FlowClient:
                 return None, None
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Personal] 错误: {str(e)}")
+                self._set_request_fingerprint(None)
+                return None, None
+        elif captcha_method == "bitbrowser":
+            debug_logger.log_info("[reCAPTCHA] 使用 bitbrowser 模式")
+            try:
+                from .browser_captcha_bitbrowser import BrowserCaptchaService
+                bit_browser_id = None
+                token_proxy_url = None
+                if token_id and self.db:
+                    token_obj = await self.db.get_token(token_id)
+                    if token_obj:
+                        bit_browser_id = getattr(token_obj, "bit_browser_id", None)
+                        token_proxy_url = getattr(token_obj, "captcha_proxy_url", None)
+                service = await BrowserCaptchaService.get_instance(self.db, bit_browser_id=bit_browser_id)
+                debug_logger.log_info(
+                    f"[reCAPTCHA] BitBrowser 窗口: {bit_browser_id or config.bit_browser_id or '<empty>'}"
+                )
+                token = await service.get_token(project_id, action, bit_browser_id=bit_browser_id)
+                fingerprint = service.get_last_fingerprint() if token else None
+                fingerprint = self._attach_token_proxy_to_fingerprint(fingerprint, token_proxy_url) if token else None
+                self._set_request_fingerprint(fingerprint if token else None)
+                return token, None
+            except RuntimeError as e:
+                error_msg = str(e)
+                debug_logger.log_error(f"[reCAPTCHA BitBrowser] {error_msg}")
+                print(f"[reCAPTCHA] ❌ BitBrowser 打码失败: {error_msg}")
+                self._set_request_fingerprint(None)
+                return None, None
+            except ImportError as e:
+                debug_logger.log_error(f"[reCAPTCHA BitBrowser] 导入失败: {str(e)}")
+                print("[reCAPTCHA] ❌ playwright 未安装，请运行: pip install playwright")
+                self._set_request_fingerprint(None)
+                return None, None
+            except Exception as e:
+                debug_logger.log_error(f"[reCAPTCHA BitBrowser] 错误: {str(e)}")
                 self._set_request_fingerprint(None)
                 return None, None
         # 有头浏览器打码 (playwright)

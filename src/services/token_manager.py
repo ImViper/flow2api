@@ -177,14 +177,27 @@ class TokenManager:
         self._refresh_locks.pop(token_id, None)
         self._project_locks.pop(token_id, None)
 
-        if config.captcha_method == "personal" and project_ids:
+        if config.captcha_method in {"personal", "bitbrowser"} and project_ids:
             try:
-                from .browser_captcha_personal import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.db)
+                if config.captcha_method == "bitbrowser":
+                    from .browser_captcha_bitbrowser import BrowserCaptchaService
+                    service = await BrowserCaptchaService.get_instance(
+                        self.db,
+                        bit_browser_id=getattr(token, "bit_browser_id", None),
+                    )
+                else:
+                    from .browser_captcha_personal import BrowserCaptchaService
+                    service = await BrowserCaptchaService.get_instance(self.db)
                 for project_id in project_ids:
-                    await service.stop_resident_mode(project_id)
+                    if config.captcha_method == "bitbrowser":
+                        await service.stop_resident_mode(
+                            project_id,
+                            bit_browser_id=getattr(token, "bit_browser_id", None),
+                        )
+                    else:
+                        await service.stop_resident_mode(project_id)
             except Exception as e:
-                debug_logger.log_warning(f"[DELETE_TOKEN] 清理 personal 浏览器状态失败: {e}")
+                debug_logger.log_warning(f"[DELETE_TOKEN] 清理浏览器打码状态失败: {e}")
 
     async def enable_token(self, token_id: int):
         """Enable a token and reset error count"""
@@ -211,6 +224,7 @@ class TokenManager:
         video_concurrency: int = -1,
         captcha_proxy_url: Optional[str] = None,
         extension_route_key: Optional[str] = None,
+        bit_browser_id: Optional[str] = None,
     ) -> Token:
         """Add a new token and prepare its pooled projects."""
         existing_token = await self.db.get_token_by_st(st)
@@ -287,6 +301,7 @@ class TokenManager:
             video_concurrency=video_concurrency,
             captcha_proxy_url=captcha_proxy_url,
             extension_route_key=extension_route_key,
+            bit_browser_id=bit_browser_id,
         )
 
         token_id = await self.db.add_token(token)
@@ -318,6 +333,7 @@ class TokenManager:
         video_concurrency: Optional[int] = None,
         captcha_proxy_url: Optional[str] = None,
         extension_route_key: Optional[str] = None,
+        bit_browser_id: Optional[str] = None,
     ):
         """Update token (支持修改project_id和project_name)
 
@@ -349,6 +365,8 @@ class TokenManager:
             update_fields["captcha_proxy_url"] = captcha_proxy_url
         if extension_route_key is not None:
             update_fields["extension_route_key"] = extension_route_key
+        if bit_browser_id is not None:
+            update_fields["bit_browser_id"] = bit_browser_id
 
         # 检查token是否因429被禁用，如果是且未过期，则清空429状态
         token = await self.db.get_token(token_id)
@@ -560,9 +578,9 @@ class TokenManager:
         try:
             from ..core.config import config
 
-            # 仅在 personal 模式下支持 ST 自动刷新
-            if config.captcha_method != "personal":
-                debug_logger.log_info(f"[ST_REFRESH] 非 personal 模式，跳过 ST 自动刷新")
+            # 仅在持久登录浏览器模式下支持 ST 自动刷新
+            if config.captcha_method not in {"personal", "bitbrowser"}:
+                debug_logger.log_info(f"[ST_REFRESH] 非 personal/bitbrowser 模式，跳过 ST 自动刷新")
                 return None
 
             if not token.current_project_id:
@@ -571,13 +589,23 @@ class TokenManager:
 
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试通过浏览器刷新 ST...")
 
-            from .browser_captcha_personal import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(self.db)
+            if config.captcha_method == "bitbrowser":
+                from .browser_captcha_bitbrowser import BrowserCaptchaService
+                service = await BrowserCaptchaService.get_instance(
+                    self.db,
+                    bit_browser_id=getattr(token, "bit_browser_id", None),
+                )
+            else:
+                from .browser_captcha_personal import BrowserCaptchaService
+                service = await BrowserCaptchaService.get_instance(self.db)
 
             refresh_timeout_seconds = 45.0
             try:
+                refresh_kwargs = {}
+                if config.captcha_method == "bitbrowser":
+                    refresh_kwargs["bit_browser_id"] = getattr(token, "bit_browser_id", None)
                 new_st = await asyncio.wait_for(
-                    service.refresh_session_token(token.current_project_id),
+                    service.refresh_session_token(token.current_project_id, **refresh_kwargs),
                     timeout=refresh_timeout_seconds,
                 )
             except asyncio.TimeoutError:
