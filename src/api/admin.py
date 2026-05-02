@@ -1726,7 +1726,7 @@ async def test_captcha_score(
     _token: str = Depends(verify_admin_token)
 ):
     """使用当前打码方式获取 token，并提交到 antcpt 校验分数。"""
-    req = request or CaptchaScoreTestRequest()
+    req = _request or CaptchaScoreTestRequest()
     website_url = (req.website_url or "https://antcpt.com/score_detector/").strip()
     website_key = (req.website_key or "6LcR_okUAAAAAPYrPe-HK_0RULO1aZM15ENyM-Mf").strip()
     action = (req.action or "homepage").strip()
@@ -1750,7 +1750,7 @@ async def test_captcha_score(
     verify_proxy_source = "none"
     verify_proxy_url = ""
     verify_impersonate = "chrome120"
-    page_verify_only = captcha_method in {"browser", "personal", "remote_browser"}
+    page_verify_only = captcha_method in {"browser", "personal", "remote_browser", "bitbrowser"}
     verify_mode = "browser_page" if page_verify_only else "server_post"
 
     try:
@@ -1803,6 +1803,30 @@ async def test_captcha_score(
                 verify_proxy_used = bool(browser_proxy_enabled and browser_proxy_url)
                 verify_proxy_source = "captcha_browser_proxy" if verify_proxy_used else "browser_direct"
                 verify_proxy_url = browser_proxy_url if verify_proxy_used else ""
+        elif captcha_method == "bitbrowser":
+            from ..services.browser_captcha_bitbrowser import BrowserCaptchaService
+            service = await BrowserCaptchaService.get_instance(db)
+            score_payload = await service.get_custom_score(
+                website_url=website_url,
+                website_key=website_key,
+                verify_url=verify_url,
+                action=action,
+                enterprise=enterprise
+            )
+            if isinstance(score_payload, dict):
+                token_value = score_payload.get("token")
+                verify_elapsed_ms = int(score_payload.get("verify_elapsed_ms") or 0)
+                verify_http_status = score_payload.get("verify_http_status")
+                verify_result = score_payload.get("verify_result") if isinstance(score_payload.get("verify_result"), dict) else {}
+                verify_mode = score_payload.get("verify_mode") or "browser_page"
+                score_token_elapsed = score_payload.get("token_elapsed_ms")
+                if isinstance(score_token_elapsed, (int, float)):
+                    token_elapsed_ms = int(score_token_elapsed)
+                fingerprint = score_payload.get("fingerprint") if isinstance(score_payload.get("fingerprint"), dict) else service.get_last_fingerprint()
+            if token_value:
+                verify_proxy_used = False
+                verify_proxy_source = "bitbrowser_profile"
+                verify_proxy_url = ""
         elif captcha_method == "remote_browser":
             score_payload = await _score_test_with_remote_browser_service(
                 website_url=website_url,

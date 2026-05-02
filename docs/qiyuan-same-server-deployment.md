@@ -17,6 +17,8 @@
 
 当前没有改 qiyuan-api 代码的前提下，要特别注意媒体文件地址：qiyuan-api 的原生 Gemini 路由会把 Flow2API 的响应基本原样返回，所以 `fileData.fileUri` 必须是客户端能访问的地址。也就是说，第一版要么公开 Flow2API 的 `/tmp` 静态文件路径，要么后续在 qiyuan-api 增加下载转存/代理逻辑。
 
+不强制购买 OSS，也不强制购买域名。第一版可以用 Windows Server 本地磁盘缓存媒体文件，再用公网 IP + 独立端口暴露 `/tmp/` 下载路径。域名和 OSS/CDN 属于更稳、更正式的生产增强项，不是跑通链路的前置条件。
+
 ## 推荐部署拓扑
 
 ```text
@@ -42,6 +44,36 @@ BitBrowser
   - 本地 API: http://127.0.0.1:54345
   - 每个 Flow/Google 账号固定绑定一个 BitBrowser 窗口 ID
 ```
+
+### 不买域名的公网 IP 拓扑
+
+如果暂时不买域名，可以先用公网 IP 和端口跑通：
+
+```text
+公网客户端
+  -> http://<SERVER_PUBLIC_IP>:3000        qiyuan-api
+  -> http://<SERVER_PUBLIC_IP>:8080/tmp/*  媒体文件下载
+
+Windows Server
+
+反向代理或 IIS
+  - http://<SERVER_PUBLIC_IP>:8080/tmp/ -> http://127.0.0.1:8000/tmp/
+  - 其他路径全部拒绝
+
+qiyuan-api
+  - 监听 0.0.0.0:3000 或由反向代理转发
+  - Gemini 渠道 Base URL 指向 http://127.0.0.1:8000
+
+Flow2API
+  - 监听 127.0.0.1:8000
+  - cache.enabled = true
+  - cache.base_url = "http://<SERVER_PUBLIC_IP>:8080"
+
+BitBrowser
+  - 本地 API: http://127.0.0.1:54345
+```
+
+这种方式可以下载，不需要 OSS，也不需要域名。代价是没有 HTTPS，URL 观感较差，服务器 IP 变更后需要同步改配置；如果客户在 HTTPS 网页里播放 HTTP 视频，浏览器可能因为混合内容策略拦截。正式对外长期服务时，建议补一个域名和 HTTPS。
 
 如果 qiyuan-api 用 Docker 跑，而 Flow2API 在 Windows 宿主机直接跑，qiyuan-api 渠道里的 Flow2API 地址不要写 `127.0.0.1:8000`，应写：
 
@@ -93,6 +125,14 @@ ServerAddress = https://api.example.com
 ```
 
 这个地址会影响 qiyuan-api 自己的视频代理地址，例如 `/v1/videos/{task_id}/content`。
+
+如果暂时只用公网 IP，可以先设置成：
+
+```text
+ServerAddress = http://<SERVER_PUBLIC_IP>:3000
+```
+
+后续换成域名或 HTTPS 后，要同步更新这里和 Flow2API 的 `cache.base_url`。
 
 ## qiyuan-api 渠道配置
 
@@ -204,6 +244,25 @@ https://media.example.com/tmp/* -> http://127.0.0.1:8000/tmp/*
 不要把 Flow2API 的管理接口和生成接口直接暴露到公网。可以在反向代理层只允许 `/tmp/`，其他路径全部拒绝。
 
 这种方案下，qiyuan-api 返回给客户端的 `fileData.fileUri` 是 Flow2API 缓存后的公网 URL，客户端可直接下载。
+
+如果没有域名，也可以使用公网 IP + 独立端口：
+
+```toml
+[cache]
+enabled = true
+timeout = 86400
+base_url = "http://<SERVER_PUBLIC_IP>:8080"
+```
+
+对应反向代理：
+
+```text
+http://<SERVER_PUBLIC_IP>:8080/tmp/* -> http://127.0.0.1:8000/tmp/*
+```
+
+早期测试不建议直接把 `timeout` 设为 `0`，否则视频文件会一直留在服务器磁盘上。可以先用 `86400`，也就是缓存 1 天；确认磁盘容量和下载量后，再决定是否长期保存。
+
+这种 IP-only 方案适合小规模或第一版验证。若下载量变大、需要 HTTPS、CDN 加速、长期保存或更稳定的 Range 下载，再考虑 OSS/CDN 或在 qiyuan-api 增加媒体转存逻辑。
 
 ### 第二版：qiyuan-api 转存/代理媒体
 

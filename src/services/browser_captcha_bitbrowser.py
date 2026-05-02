@@ -53,7 +53,9 @@ class BrowserCaptchaService:
         self._initialized = False
         self._connect_lock = asyncio.Lock()
         self._resident_lock = asyncio.Lock()
+        self._custom_lock = asyncio.Lock()
         self._resident_pages: Dict[str, BitBrowserResidentPage] = {}
+        self._custom_pages: Dict[str, Dict[str, Any]] = {}
         self._project_affinity: Dict[str, str] = {}
         self._slot_seq = 0
         self._last_fingerprint: Optional[Dict[str, Any]] = None
@@ -190,6 +192,7 @@ class BrowserCaptchaService:
                 self._context = self._browser.contexts[0]
             else:
                 self._context = await self._browser.new_context()
+            await self._close_orphan_recaptcha_pages()
             self._initialized = True
             debug_logger.log_info(f"[BitBrowserCaptcha] 已连接 BitBrowser CDP: browser_id={self._browser_id}")
 
@@ -199,6 +202,14 @@ class BrowserCaptchaService:
                 pages = [item.page for item in self._resident_pages.values() if item.page]
                 self._resident_pages.clear()
                 self._project_affinity.clear()
+            async with self._custom_lock:
+                custom_pages = [
+                    item.get("page")
+                    for item in self._custom_pages.values()
+                    if isinstance(item, dict) and item.get("page")
+                ]
+                self._custom_pages.clear()
+            pages.extend(custom_pages)
             for page in pages:
                 try:
                     await page.close()
@@ -229,16 +240,106 @@ class BrowserCaptchaService:
     async def warmup_resident_tabs(self, project_ids: Iterable[str], limit: Optional[int] = None) -> list[str]:
         await self.initialize()
         warmed: list[str] = []
-        max_pages = max(1, int(limit or config.personal_max_resident_tabs or 1))
+        max_pages = max(1, int(limit or self._max_resident_pages()))
         for project_id in list(project_ids or [])[:max_pages]:
             slot_id, info = await self._ensure_resident_page(str(project_id or "").strip())
             if slot_id and info:
                 warmed.append(slot_id)
         return warmed
 
+    def _max_resident_pages(self) -> int:
+        try:
+            return max(1, int(config.personal_max_resident_tabs or 1))
+        except Exception:
+            return 1
+
+    def _idle_resident_ttl_seconds(self) -> int:
+        try:
+            return max(0, int(config.personal_idle_tab_ttl_seconds or 0))
+        except Exception:
+            return 0
+
     def _resident_key(self, project_id: str, bit_browser_id: Optional[str] = None) -> str:
         browser_id = self._select_browser_id(bit_browser_id)
         return f"{browser_id}::{str(project_id or '').strip()}"
+
+    def _drop_affinity_for_slot_locked(self, slot_id: str):
+        stale_keys = [
+            key for key, mapped_slot_id in self._project_affinity.items()
+            if mapped_slot_id == slot_id
+        ]
+        for key in stale_keys:
+            self._project_affinity.pop(key, None)
+
+    def _select_reusable_resident_locked(self) -> tuple[Optional[str], Optional[BitBrowserResidentPage]]:
+        candidates = [
+            (slot_id, info)
+            for slot_id, info in self._resident_pages.items()
+            if info and info.page
+        ]
+        if not candidates:
+            return None, None
+
+        ready_idle = [
+            item for item in candidates
+            if item[1].recaptcha_ready and not item[1].solve_lock.locked()
+        ]
+        ready_any = [item for item in candidates if item[1].recaptcha_ready]
+        idle_any = [item for item in candidates if not item[1].solve_lock.locked()]
+        pool = ready_idle or ready_any or idle_any or candidates
+        return min(pool, key=lambda item: item[1].last_used_at)
+
+    async def _close_resident_page_quietly(self, info: Optional[BitBrowserResidentPage]):
+        if not info or not info.page:
+            return
+        try:
+            await info.page.close()
+        except Exception:
+            pass
+
+    async def _close_orphan_recaptcha_pages(self):
+        if not self._context:
+            return
+        target_url = "https://labs.google/fx/api/auth/providers"
+        closed_count = 0
+        for page in list(self._context.pages):
+            try:
+                if page.is_closed():
+                    continue
+                if (page.url or "").rstrip("/") != target_url.rstrip("/"):
+                    continue
+                await page.close()
+                closed_count += 1
+            except Exception:
+                continue
+        if closed_count:
+            debug_logger.log_info(
+                f"[BitBrowserCaptcha] 已清理旧的孤儿打码标签页: count={closed_count}"
+            )
+
+    async def _prune_idle_resident_pages(self):
+        ttl_seconds = self._idle_resident_ttl_seconds()
+        if ttl_seconds <= 0:
+            return
+
+        now_value = time.time()
+        stale_pages: list[BitBrowserResidentPage] = []
+        async with self._resident_lock:
+            for slot_id, info in list(self._resident_pages.items()):
+                if not info or info.solve_lock.locked():
+                    continue
+                if (now_value - info.last_used_at) < ttl_seconds:
+                    continue
+                stale_pages.append(info)
+                self._resident_pages.pop(slot_id, None)
+                self._drop_affinity_for_slot_locked(slot_id)
+
+        for info in stale_pages:
+            await self._close_resident_page_quietly(info)
+        if stale_pages:
+            debug_logger.log_info(
+                f"[BitBrowserCaptcha] 已回收空闲常驻标签页: count={len(stale_pages)}, ttl={ttl_seconds}s"
+            )
 
     async def stop_resident_mode(self, project_id: str, bit_browser_id: Optional[str] = None):
         normalized_project = self._resident_key(project_id, bit_browser_id)
@@ -271,15 +372,36 @@ class BrowserCaptchaService:
         if not project_id:
             return None, None
         await self.initialize(bit_browser_id=bit_browser_id)
+        await self._prune_idle_resident_pages()
         affinity_key = self._resident_key(project_id, bit_browser_id)
+        stale_pages: list[BitBrowserResidentPage] = []
         async with self._resident_lock:
             slot_id = self._project_affinity.get(affinity_key)
             existing = self._resident_pages.get(slot_id) if slot_id else None
             if existing and existing.page and existing.recaptcha_ready:
                 return slot_id, existing
+            if slot_id and existing:
+                stale_pages.append(existing)
+                self._resident_pages.pop(slot_id, None)
+                self._drop_affinity_for_slot_locked(slot_id)
+
+            max_pages = self._max_resident_pages()
+            if len(self._resident_pages) >= max_pages:
+                reusable_slot, reusable_info = self._select_reusable_resident_locked()
+                if reusable_slot and reusable_info:
+                    self._project_affinity[affinity_key] = reusable_slot
+                    reusable_info.project_id = project_id
+                    debug_logger.log_info(
+                        f"[BitBrowserCaptcha] 常驻标签页达到上限({max_pages})，复用 slot={reusable_slot}"
+                    )
+                    return reusable_slot, reusable_info
+
             self._slot_seq += 1
             slot_id = f"bit-{self._slot_seq}"
             self._project_affinity[affinity_key] = slot_id
+
+        for info in stale_pages:
+            await self._close_resident_page_quietly(info)
 
         info = await self._create_resident_page(slot_id, project_id)
         if not info:
@@ -317,12 +439,7 @@ class BrowserCaptchaService:
         async def handle_route(route):
             request_url = route.request.url.rstrip("/")
             if request_url == page_url.rstrip("/"):
-                html = f"""<html><head><script>
-                const script = document.createElement('script');
-                script.src = 'https://www.google.com/recaptcha/enterprise.js?render={website_key}';
-                script.async = true;
-                document.head.appendChild(script);
-                </script></head><body></body></html>"""
+                html = """<html><head><title>flow2api recaptcha</title></head><body></body></html>"""
                 await route.fulfill(status=200, content_type="text/html", body=html)
             elif any(domain in route.request.url for domain in ("google.com", "gstatic.com", "recaptcha.net")):
                 await route.continue_()
@@ -330,11 +447,67 @@ class BrowserCaptchaService:
                 await route.abort()
 
         await page.route("**/*", handle_route)
-        await page.goto(page_url, wait_until="load", timeout=20000)
-        await page.wait_for_function(
-            "typeof grecaptcha !== 'undefined' && grecaptcha.enterprise && typeof grecaptcha.enterprise.ready === 'function'",
-            timeout=15000,
+        await page.goto(page_url, wait_until="domcontentloaded", timeout=10000)
+        if not await self._inject_recaptcha_script_if_needed(
+            page,
+            website_key,
+            enterprise=True,
+            timeout_ms=45000,
+        ):
+            raise RuntimeError("reCAPTCHA enterprise script did not become ready")
+
+    async def _inject_recaptcha_script_if_needed(
+        self,
+        page,
+        website_key: str,
+        enterprise: bool = True,
+        timeout_ms: int = 15000,
+    ) -> bool:
+        wait_expression = (
+            "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && "
+            "typeof grecaptcha.enterprise.execute === 'function'"
+        ) if enterprise else (
+            "typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function'"
         )
+        try:
+            await page.wait_for_function(wait_expression, timeout=2500)
+            return True
+        except Exception:
+            pass
+
+        script_path = "recaptcha/enterprise.js" if enterprise else "recaptcha/api.js"
+        primary_url = f"https://www.google.com/{script_path}?render={website_key}"
+        secondary_url = f"https://www.recaptcha.net/{script_path}?render={website_key}"
+        try:
+            await page.evaluate(
+                """
+                ([primaryUrl, secondaryUrl]) => {
+                    const existing = Array.from(document.scripts || []).some((script) => {
+                        const src = script && script.src || "";
+                        return src.includes("/recaptcha/");
+                    });
+                    if (existing) return;
+                    const urls = [primaryUrl, secondaryUrl];
+                    const loadScript = (index) => {
+                        if (index >= urls.length) return;
+                        const script = document.createElement("script");
+                        script.src = urls[index];
+                        script.async = true;
+                        script.onerror = () => loadScript(index + 1);
+                        document.head.appendChild(script);
+                    };
+                    loadScript(0);
+                }
+                """,
+                [primary_url, secondary_url],
+            )
+            await page.wait_for_function(wait_expression, timeout=timeout_ms)
+            return True
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[BitBrowserCaptcha] reCAPTCHA script not ready: {type(e).__name__}: {str(e)[:200]}"
+            )
+            return False
 
     async def _capture_page_fingerprint(self, page) -> Optional[Dict[str, Any]]:
         try:
@@ -419,26 +592,332 @@ class BrowserCaptchaService:
                     pass
 
     async def _execute_recaptcha(self, page, action: str) -> Optional[str]:
+        if not await self._inject_recaptcha_script_if_needed(page, self.website_key, enterprise=True):
+            return None
+        return await asyncio.wait_for(
+            page.evaluate(
+                """
+                ([websiteKey, actionName]) => {
+                    return new Promise((resolve, reject) => {
+                        const timeout = setTimeout(() => reject(new Error('timeout')), 45000);
+                        try {
+                            grecaptcha.enterprise.ready(() => {
+                                grecaptcha.enterprise.execute(websiteKey, {action: actionName})
+                                    .then((token) => { clearTimeout(timeout); resolve(token); })
+                                    .catch((err) => { clearTimeout(timeout); reject(err); });
+                            });
+                        } catch (err) {
+                            clearTimeout(timeout);
+                            reject(err);
+                        }
+                    });
+                }
+                """,
+                [self.website_key, action or "IMAGE_GENERATION"],
+            ),
+            timeout=55,
+        )
+
+    async def _execute_custom_recaptcha(
+        self,
+        page,
+        website_key: str,
+        action: str,
+        enterprise: bool = False,
+    ) -> Optional[str]:
+        if not await self._inject_recaptcha_script_if_needed(page, website_key, enterprise=enterprise):
+            return None
+        execute_target = "grecaptcha.enterprise.execute" if enterprise else "grecaptcha.execute"
+        ready_target = "grecaptcha.enterprise.ready" if enterprise else "grecaptcha.ready"
         return await asyncio.wait_for(
             page.evaluate(
                 f"""
-                (actionName) => {{
+                ([websiteKey, actionName]) => {{
                     return new Promise((resolve, reject) => {{
                         const timeout = setTimeout(() => reject(new Error('timeout')), 25000);
-                        grecaptcha.enterprise.ready(() => {{
-                            grecaptcha.enterprise.execute('{self.website_key}', {{action: actionName}})
+                        try {{
+                            {ready_target}(() => {{
+                                {execute_target}(websiteKey, {{action: actionName}})
                                 .then((token) => {{ clearTimeout(timeout); resolve(token); }})
                                 .catch((err) => {{ clearTimeout(timeout); reject(err); }});
-                        }});
+                            }});
+                        }} catch (err) {{
+                            clearTimeout(timeout);
+                            reject(err);
+                        }}
                     }});
                 }}
                 """,
-                action or "IMAGE_GENERATION",
+                [website_key, action or "homepage"],
             ),
             timeout=30,
         )
 
+    async def _verify_score_in_page(self, page, token: str, verify_url: str) -> Dict[str, Any]:
+        _ = token
+        _ = verify_url
+        started_at = time.time()
+        timeout_seconds = 25.0
+        refresh_clicked = False
+        last_snapshot: Dict[str, Any] = {}
+        try:
+            timeout_seconds = float(getattr(config, "browser_score_dom_wait_seconds", 25) or 25)
+        except Exception:
+            pass
+
+        while (time.time() - started_at) < timeout_seconds:
+            try:
+                result = await page.evaluate(
+                    """
+                    () => {
+                        const bodyText = ((document.body && document.body.innerText) || "")
+                            .replace(/\\u00a0/g, " ")
+                            .replace(/\\r/g, "");
+                        const patterns = [
+                            { source: "current_score", regex: /Your score is:\\s*([01](?:\\.\\d+)?)/i },
+                            { source: "selected_score", regex: /Selected Score Test:[\\s\\S]{0,400}?Score:\\s*([01](?:\\.\\d+)?)/i },
+                            { source: "history_score", regex: /(?:^|\\n)\\s*Score:\\s*([01](?:\\.\\d+)?)\\s*;/i },
+                        ];
+                        let score = null;
+                        let source = "";
+                        for (const item of patterns) {
+                            const match = bodyText.match(item.regex);
+                            if (!match) continue;
+                            const parsed = Number(match[1]);
+                            if (!Number.isNaN(parsed) && parsed >= 0 && parsed <= 1) {
+                                score = parsed;
+                                source = item.source;
+                                break;
+                            }
+                        }
+                        const uaMatch = bodyText.match(/Current User Agent:\\s*([^\\n]+)/i);
+                        const ipMatch = bodyText.match(/Current IP Address:\\s*([^\\n]+)/i);
+                        return {
+                            score,
+                            source,
+                            raw_text: bodyText.slice(0, 4000),
+                            current_user_agent: uaMatch ? uaMatch[1].trim() : "",
+                            current_ip_address: ipMatch ? ipMatch[1].trim() : "",
+                            title: document.title || "",
+                            url: location.href || "",
+                        };
+                    }
+                    """
+                )
+            except Exception as e:
+                result = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+            if isinstance(result, dict):
+                last_snapshot = result
+                score = result.get("score")
+                if isinstance(score, (int, float)):
+                    elapsed_ms = int((time.time() - started_at) * 1000)
+                    return {
+                        "verify_mode": "browser_page_dom",
+                        "verify_elapsed_ms": elapsed_ms,
+                        "verify_http_status": None,
+                        "verify_result": {
+                            "success": True,
+                            "score": score,
+                            "source": result.get("source") or "antcpt_dom",
+                            "raw_text": result.get("raw_text") or "",
+                            "current_user_agent": result.get("current_user_agent") or "",
+                            "current_ip_address": result.get("current_ip_address") or "",
+                            "page_title": result.get("title") or "",
+                            "page_url": result.get("url") or "",
+                        },
+                    }
+
+            if not refresh_clicked and (time.time() - started_at) >= 2:
+                refresh_clicked = True
+                try:
+                    await page.evaluate(
+                        """
+                        () => {
+                            const nodes = Array.from(
+                                document.querySelectorAll('button, input[type="button"], input[type="submit"], a')
+                            );
+                            const target = nodes.find((node) => {
+                                const text = (node.innerText || node.textContent || node.value || "").trim();
+                                return /Refresh score now!?/i.test(text);
+                            });
+                            if (target) {
+                                target.click();
+                                return true;
+                            }
+                            return false;
+                        }
+                        """
+                    )
+                except Exception:
+                    pass
+            await asyncio.sleep(0.5)
+
+        elapsed_ms = int((time.time() - started_at) * 1000)
+        return {
+            "verify_mode": "browser_page_dom",
+            "verify_elapsed_ms": elapsed_ms,
+            "verify_http_status": None,
+            "verify_result": {
+                "success": False,
+                "score": None,
+                "source": "antcpt_dom_timeout",
+                "raw_text": last_snapshot.get("raw_text") or "",
+                "current_user_agent": last_snapshot.get("current_user_agent") or "",
+                "current_ip_address": last_snapshot.get("current_ip_address") or "",
+                "page_title": last_snapshot.get("title") or "",
+                "page_url": last_snapshot.get("url") or "",
+                "error": last_snapshot.get("error") or "score not found in page",
+            },
+        }
+
+    async def get_custom_token(
+        self,
+        website_url: str,
+        website_key: str,
+        action: str = "homepage",
+        enterprise: bool = False,
+    ) -> Optional[str]:
+        payload = await self._get_custom_payload(
+            website_url=website_url,
+            website_key=website_key,
+            action=action,
+            enterprise=enterprise,
+            verify_url=None,
+        )
+        if isinstance(payload, dict):
+            return payload.get("token")
+        return None
+
+    async def get_custom_score(
+        self,
+        website_url: str,
+        website_key: str,
+        verify_url: str,
+        action: str = "homepage",
+        enterprise: bool = False,
+    ) -> Dict[str, Any]:
+        payload = await self._get_custom_payload(
+            website_url=website_url,
+            website_key=website_key,
+            action=action,
+            enterprise=enterprise,
+            verify_url=verify_url,
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def _get_custom_payload(
+        self,
+        website_url: str,
+        website_key: str,
+        action: str,
+        enterprise: bool,
+        verify_url: Optional[str],
+    ) -> Dict[str, Any]:
+        await self.initialize()
+        cache_key = f"{website_url}|{website_key}|{1 if enterprise else 0}"
+        token_started_at = time.time()
+        async with self._custom_lock:
+            custom_info = self._custom_pages.get(cache_key)
+            page = custom_info.get("page") if isinstance(custom_info, dict) else None
+            try:
+                if page is None or page.is_closed():
+                    page = await self._context.new_page()
+                    await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                    await page.goto(website_url, wait_until="domcontentloaded", timeout=30000)
+                    custom_info = {
+                        "page": page,
+                        "created_at": time.time(),
+                        "recaptcha_ready": False,
+                        "warmed_up": False,
+                    }
+                    self._custom_pages[cache_key] = custom_info
+
+                try:
+                    await page.bring_to_front()
+                    await page.mouse.move(320, 220)
+                    await page.mouse.move(520, 320, steps=12)
+                    await page.mouse.wheel(0, 240)
+                    await page.evaluate(
+                        """
+                        () => {
+                            try {
+                                window.focus();
+                                window.dispatchEvent(new Event("focus"));
+                                document.dispatchEvent(new MouseEvent("mousemove", {
+                                    bubbles: true,
+                                    clientX: Math.max(32, Math.floor((window.innerWidth || 1280) * 0.4)),
+                                    clientY: Math.max(32, Math.floor((window.innerHeight || 720) * 0.35))
+                                }));
+                                window.scrollTo(0, Math.min(280, document.body?.scrollHeight || 280));
+                            } catch (e) {}
+                        }
+                        """
+                    )
+                except Exception:
+                    pass
+
+                if not custom_info.get("recaptcha_ready"):
+                    custom_info["recaptcha_ready"] = await self._inject_recaptcha_script_if_needed(
+                        page,
+                        website_key,
+                        enterprise=enterprise,
+                    )
+                    if not custom_info["recaptcha_ready"]:
+                        raise RuntimeError("custom reCAPTCHA not ready")
+
+                if not custom_info.get("warmed_up"):
+                    try:
+                        warmup_seconds = float(getattr(config, "browser_score_test_warmup_seconds", 12) or 12)
+                    except Exception:
+                        warmup_seconds = 12.0
+                    if warmup_seconds > 0:
+                        debug_logger.log_info(
+                            f"[BitBrowserCaptcha] custom score page warmup {warmup_seconds:.1f}s: {website_url}"
+                        )
+                        await asyncio.sleep(warmup_seconds)
+                    custom_info["warmed_up"] = True
+                else:
+                    try:
+                        settle_seconds = float(getattr(config, "browser_score_test_settle_seconds", 2.5) or 2.5)
+                    except Exception:
+                        settle_seconds = 2.5
+                    if settle_seconds > 0:
+                        await asyncio.sleep(settle_seconds)
+
+                token = await self._execute_custom_recaptcha(page, website_key, action, enterprise=enterprise)
+                if not token:
+                    raise RuntimeError("custom reCAPTCHA returned empty token")
+                fingerprint = await self._capture_page_fingerprint(page)
+                self._remember_fingerprint(fingerprint)
+                token_elapsed_ms = int((time.time() - token_started_at) * 1000)
+
+                payload: Dict[str, Any] = {
+                    "token": token,
+                    "token_elapsed_ms": token_elapsed_ms,
+                    "fingerprint": fingerprint,
+                }
+                if verify_url:
+                    payload.update(await self._verify_score_in_page(page, token, verify_url))
+                return payload
+            except Exception as e:
+                debug_logger.log_warning(
+                    f"[BitBrowserCaptcha] custom score/token failed: {type(e).__name__}: {str(e)[:200]}"
+                )
+                stale_info = self._custom_pages.pop(cache_key, None)
+                stale_page = stale_info.get("page") if isinstance(stale_info, dict) else page
+                if stale_page:
+                    try:
+                        await stale_page.close()
+                    except Exception:
+                        pass
+                return {}
+
     async def refresh_session_token(self, project_id: str, bit_browser_id: Optional[str] = None) -> Optional[str]:
+        credentials = await self.refresh_session_credentials(project_id, bit_browser_id=bit_browser_id)
+        if credentials and credentials.get("st"):
+            return str(credentials["st"])
+
         await self.initialize(bit_browser_id=bit_browser_id)
         page = None
         try:
@@ -461,6 +940,55 @@ class BrowserCaptchaService:
             """)
         except Exception as e:
             debug_logger.log_warning(f"[BitBrowserCaptcha] 刷新 ST 失败: {e}")
+            return None
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    async def refresh_session_credentials(self, project_id: str, bit_browser_id: Optional[str] = None) -> Optional[dict]:
+        await self.initialize(bit_browser_id=bit_browser_id)
+        page = None
+        try:
+            page = await self._context.new_page()
+            target = "https://labs.google/fx/tools/flow"
+            if project_id:
+                target = f"{target}/project/{project_id}"
+            await page.goto(target, wait_until="commit", timeout=30000)
+            await page.wait_for_timeout(3000)
+            session = await page.evaluate("""
+                async () => {
+                    const result = { ok: false, status: 0, json: null, text: "", error: "" };
+                    try {
+                        const response = await fetch('/fx/api/auth/session', { credentials: 'include' });
+                        result.status = response.status;
+                        const text = await response.text();
+                        result.text = text.slice(0, 500);
+                        try { result.json = JSON.parse(text); } catch (e) {}
+                        result.ok = response.ok;
+                    } catch (e) {
+                        result.error = String(e && e.message || e);
+                    }
+                    return result;
+                }
+            """)
+            payload = session.get("json") if isinstance(session, dict) else None
+            if not isinstance(payload, dict) or not payload.get("access_token"):
+                debug_logger.log_warning(f"[BitBrowserCaptcha] browser session refresh failed: {session}")
+                return None
+
+            cookies = await self._context.cookies()
+            st = None
+            for cookie in cookies:
+                if cookie.get("name") == "__Secure-next-auth.session-token" and cookie.get("value"):
+                    st = str(cookie["value"])
+                    break
+            payload["st"] = st
+            return payload
+        except Exception as e:
+            debug_logger.log_warning(f"[BitBrowserCaptcha] refresh browser session credentials failed: {e}")
             return None
         finally:
             if page:

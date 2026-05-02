@@ -153,7 +153,25 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 print(f"❌ Auto-unban task error: {e}")
 
+    async def auto_refresh_tokens_task():
+        """Periodically refresh active tokens before traffic needs them."""
+        while True:
+            try:
+                await asyncio.sleep(600)
+                result = await token_manager.refresh_expiring_tokens()
+                if result.get("needs_refresh"):
+                    print(
+                        "AT auto-refresh checked "
+                        f"{result['checked']} token(s): "
+                        f"refreshed={result['refreshed']}, failed={result['failed']}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"AT auto-refresh task error: {e}")
+
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
+    auto_refresh_task_handle = asyncio.create_task(auto_refresh_tokens_task())
 
     print(f"✓ Database initialized")
     print(f"✓ Total tokens: {len(tokens)}")
@@ -174,8 +192,13 @@ async def lifespan(app: FastAPI):
     await generation_handler.file_cache.stop_cleanup_task()
     # Stop auto-unban task
     auto_unban_task_handle.cancel()
+    auto_refresh_task_handle.cancel()
     try:
         await auto_unban_task_handle
+    except asyncio.CancelledError:
+        pass
+    try:
+        await auto_refresh_task_handle
     except asyncio.CancelledError:
         pass
     # Close browser if initialized

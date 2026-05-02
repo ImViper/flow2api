@@ -2,6 +2,8 @@
 
 本文档说明本项目当前的 BitBrowser 接入方式，以及如何让多个已配置代理的 BitBrowser 窗口分别服务不同 Flow 账号。
 
+如果是新增账号、打开窗口让用户登录、提取 Session Token 并绑定窗口，请按 [BitBrowser 上号标准流程](./bitbrowser-account-onboarding.md) 执行。
+
 ## 目标
 
 BitBrowser 模式用于复用你已经打开并登录过 Google/Flow 的 BitBrowser 窗口，通过 CDP 连接该窗口获取 reCAPTCHA token 和刷新 Flow session token。
@@ -65,6 +67,17 @@ Token 导出也会带上 `bit_browser_id`，方便后续迁移或批量维护。
 5. Playwright 通过 CDP 复用该窗口上下文
 6. 常驻打码页按 `窗口 ID + project_id` 绑定，避免多个窗口之间串用
 7. Flow API 请求会尽量复用该窗口采集到的浏览器指纹请求头
+
+## 标签页上限和回收
+
+BitBrowser 模式会复用常驻 reCAPTCHA 标签页，不应该为每次请求无限新开 tab。
+
+当前标签页池受以下配置限制：
+
+- `personal_max_resident_tabs`：单个 BitBrowser 服务实例最多保留的常驻打码 tab 数量。
+- `personal_idle_tab_ttl_seconds`：常驻 tab 空闲超过该秒数后自动关闭；设为 `0` 表示不按空闲时间回收。
+
+当请求命中新的 `project_id` 且常驻 tab 数量已达到上限时，服务会复用最久未使用的可用 tab，而不是继续打开新 tab。
 
 ## 多窗口注意事项
 

@@ -3,10 +3,18 @@ import asyncio
 import aiosqlite
 import json
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig
+
+
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def beijing_timestamp() -> str:
+    """Return a SQLite-friendly Beijing local timestamp."""
+    return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class Database:
@@ -1426,10 +1434,14 @@ class Database:
     # Request log operations
     async def add_request_log(self, log: RequestLog) -> int:
         """Add request log and return log id"""
+        now = beijing_timestamp()
         async with self._connect(write=True) as db:
             cursor = await db.execute("""
-                INSERT INTO request_logs (token_id, operation, request_body, response_body, status_code, duration, status_text, progress)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO request_logs (
+                    token_id, operation, request_body, response_body, status_code,
+                    duration, status_text, progress, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 log.token_id,
                 log.operation,
@@ -1439,6 +1451,8 @@ class Database:
                 log.duration,
                 log.status_text or "",
                 log.progress,
+                now,
+                now,
             ))
             await db.commit()
             return cursor.lastrowid
@@ -1467,7 +1481,8 @@ class Database:
         for key, value in update_fields.items():
             clauses.append(f"{key} = ?")
             values.append(value)
-        clauses.append("updated_at = CURRENT_TIMESTAMP")
+        clauses.append("updated_at = ?")
+        values.append(beijing_timestamp())
         values.append(log_id)
 
         async with self._connect(write=True) as db:

@@ -451,6 +451,28 @@ class TokenManager:
         valid_token = await self.ensure_valid_token(token_obj)
         return valid_token is not None
 
+    async def refresh_expiring_tokens(self) -> dict:
+        """Refresh active tokens whose AT is missing, expired, or close to expiry."""
+        tokens = await self.get_active_tokens()
+        result = {
+            "checked": len(tokens),
+            "needs_refresh": 0,
+            "refreshed": 0,
+            "failed": 0,
+        }
+
+        for token in tokens:
+            if not self.needs_at_refresh(token):
+                continue
+
+            result["needs_refresh"] += 1
+            refreshed_token = await self.ensure_valid_token(token)
+            if refreshed_token:
+                result["refreshed"] += 1
+            else:
+                result["failed"] += 1
+
+        return result
 
     async def _refresh_at_inner(self, token_id: int) -> bool:
         """Perform exactly one real AT refresh attempt."""
@@ -464,6 +486,14 @@ class TokenManager:
             if not token:
                 return False
 
+            if config.captcha_method == "bitbrowser":
+                result = await self._refresh_at_from_bitbrowser_session(token_id, token)
+                if result:
+                    return True
+                debug_logger.log_info(
+                    f"[AT_REFRESH] Token {token_id}: BitBrowser live session refresh failed, falling back to ST"
+                )
+
             result = await self._do_refresh_at(token_id, token.st)
             if result:
                 return True
@@ -474,11 +504,95 @@ class TokenManager:
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST refreshed, retrying AT refresh...")
                 result = await self._do_refresh_at(token_id, new_st)
                 if result:
+                    await self.db.update_token(token_id, st=new_st)
+                    debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: ST updated after AT verification")
+                    record_token_refresh("st", "success")
                     return True
+                record_token_refresh("st", "failure")
 
             debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
             await self.disable_token(token_id)
             return False
+
+    async def _refresh_at_from_bitbrowser_session(self, token_id: int, token: Token) -> bool:
+        """Refresh AT by asking the bound BitBrowser page for its live auth session."""
+        if not token.current_project_id:
+            debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: no project_id for BitBrowser session refresh")
+            return False
+
+        try:
+            from .browser_captcha_bitbrowser import BrowserCaptchaService
+
+            service = await BrowserCaptchaService.get_instance(
+                self.db,
+                bit_browser_id=getattr(token, "bit_browser_id", None),
+            )
+            session = await asyncio.wait_for(
+                service.refresh_session_credentials(
+                    token.current_project_id,
+                    bit_browser_id=getattr(token, "bit_browser_id", None),
+                ),
+                timeout=60.0,
+            )
+        except asyncio.TimeoutError:
+            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: BitBrowser session refresh timed out")
+            record_token_refresh("at", "failure")
+            return False
+        except Exception as e:
+            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: BitBrowser session refresh failed - {e}")
+            record_token_refresh("at", "failure")
+            return False
+
+        if not isinstance(session, dict) or not session.get("access_token"):
+            debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: BitBrowser session did not return AT")
+            record_token_refresh("at", "failure")
+            return False
+
+        new_at = session["access_token"]
+        expires = session.get("expires")
+        new_at_expires = None
+        if expires:
+            try:
+                new_at_expires = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+            except Exception:
+                new_at_expires = None
+
+        if new_at_expires:
+            at_expires_aware = (
+                new_at_expires.replace(tzinfo=timezone.utc)
+                if new_at_expires.tzinfo is None
+                else new_at_expires
+            )
+            if at_expires_aware <= datetime.now(timezone.utc):
+                debug_logger.log_warning(
+                    f"[AT_REFRESH] Token {token_id}: BitBrowser session returned expired AT ({at_expires_aware})"
+                )
+                record_token_refresh("at", "failure")
+                return False
+
+        try:
+            credits_result = await self.flow_client.get_credits(new_at)
+        except Exception as e:
+            debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: BitBrowser AT verification failed: {e}")
+            record_token_refresh("at", "failure")
+            return False
+
+        update_fields = {
+            "at": new_at,
+            "at_expires": new_at_expires,
+            "credits": credits_result.get("credits", 0),
+            "user_paygate_tier": credits_result.get("userPaygateTier"),
+        }
+        new_st = session.get("st")
+        if new_st and new_st != token.st:
+            update_fields["st"] = new_st
+            record_token_refresh("st", "success")
+
+        await self.db.update_token(token_id, **update_fields)
+        debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: BitBrowser session AT refresh success")
+        debug_logger.log_info(f"  - 新过期时间: {new_at_expires}")
+        record_token_refresh("at", "success")
+        return True
 
     async def _refresh_at(self, token_id: int) -> bool:
         """Coalesce concurrent AT refresh calls for the same token."""
@@ -523,25 +637,31 @@ class TokenManager:
                     new_at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
                 except:
                     pass
+            if new_at_expires:
+                if new_at_expires.tzinfo is None:
+                    new_at_expires_aware = new_at_expires.replace(tzinfo=timezone.utc)
+                else:
+                    new_at_expires_aware = new_at_expires
 
-            # 更新数据库
-            await self.db.update_token(
-                token_id,
-                at=new_at,
-                at_expires=new_at_expires
-            )
-
-            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT刷新成功")
-            debug_logger.log_info(f"  - 新过期时间: {new_at_expires}")
+                if new_at_expires_aware <= datetime.now(timezone.utc):
+                    debug_logger.log_warning(
+                        f"[AT_REFRESH] Token {token_id}: ST 返回的 AT 已过期 ({new_at_expires_aware})"
+                    )
+                    record_token_refresh("at", "failure")
+                    return False
 
             # 验证 AT 有效性：通过 get_credits 测试
             try:
                 credits_result = await self.flow_client.get_credits(new_at)
                 await self.db.update_token(
                     token_id,
+                    at=new_at,
+                    at_expires=new_at_expires,
                     credits=credits_result.get("credits", 0),
                     user_paygate_tier=credits_result.get("userPaygateTier"),
                 )
+                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT刷新成功")
+                debug_logger.log_info(f"  - 新过期时间: {new_at_expires}")
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT 验证成功（余额: {credits_result.get('credits', 0)}）")
                 record_token_refresh("at", "success")
                 return True
@@ -555,6 +675,13 @@ class TokenManager:
                 else:
                     # 其他错误（如网络问题），仍视为成功
                     debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT 验证时发生非认证错误: {error_msg}")
+                    await self.db.update_token(
+                        token_id,
+                        at=new_at,
+                        at_expires=new_at_expires
+                    )
+                    debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT刷新成功")
+                    debug_logger.log_info(f"  - 新过期时间: {new_at_expires}")
                     record_token_refresh("at", "success")
                     return True
 
@@ -615,10 +742,7 @@ class TokenManager:
                 record_token_refresh("st", "failure")
                 return None
             if new_st and new_st != token.st:
-                # 更新数据库中的 ST
-                await self.db.update_token(token_id, st=new_st)
-                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: ST 已自动更新")
-                record_token_refresh("st", "success")
+                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 获取到新的 ST 候选，等待 AT 验证")
                 return new_st
             elif new_st == token.st:
                 debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: 获取到的 ST 与原 ST 相同，可能登录已失效")

@@ -2,13 +2,53 @@
 
 ## 基础信息
 
-- Base URL: `http://<host>:8000`
+- 本机服务地址: `http://127.0.0.1:51075`
+- 局域网调用地址: `http://192.168.10.153:51075`
+- Base URL: `http://192.168.10.153:51075`
 - Content-Type: `application/json`
 - OpenAI 兼容接口认证: `Authorization: Bearer <API_KEY>`
 - Gemini 兼容接口认证:
   - `x-goog-api-key: <API_KEY>`
   - `Authorization: Bearer <API_KEY>`
   - `?key=<API_KEY>`
+
+### 当前机器调用说明
+
+当前 Flow2API 已监听 `0.0.0.0:51075`，同一局域网内其他机器请使用:
+
+```text
+http://192.168.10.153:51075
+```
+
+在本机自测可以使用:
+
+```text
+http://127.0.0.1:51075
+```
+
+`127.0.0.1` 只代表调用方自己的机器，发给其他人或其他服务配置渠道时不要写 `127.0.0.1`，应写 `http://192.168.10.153:51075`。如果对方无法访问，请先检查 Windows 防火墙是否放行 TCP `51075`，以及对方是否和本机在同一网络内。
+
+当前示例 API Key:
+
+```text
+han1234
+```
+
+示例命令里如果使用 `$BASE_URL` 和 `$API_KEY`，请先按调用环境设置:
+
+PowerShell:
+
+```powershell
+$env:BASE_URL = "http://192.168.10.153:51075"
+$env:API_KEY = "han1234"
+```
+
+Bash:
+
+```bash
+export BASE_URL="http://192.168.10.153:51075"
+export API_KEY="han1234"
+```
 
 ## 模型列表
 
@@ -300,7 +340,7 @@ curl -X POST "$BASE_URL/v1/chat/completions" \
 OpenAI 兼容响应里，`choices[0].message.content` 会返回 HTML 视频标签:
 
 ```html
-<video src='http://<host>:8000/tmp/<video>.mp4' controls></video>
+<video src='http://192.168.10.153:51075/tmp/<video>.mp4' controls></video>
 ```
 
 ### 图生视频
@@ -497,7 +537,7 @@ curl -X POST "$BASE_URL/models/veo_3_1_t2v_fast:generateContent" \
           {
             "fileData": {
               "mimeType": "video/mp4",
-              "fileUri": "http://<host>:8000/tmp/<video>.mp4"
+              "fileUri": "http://192.168.10.153:51075/tmp/<video>.mp4"
             }
           }
         ]
